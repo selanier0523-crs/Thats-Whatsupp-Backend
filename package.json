@@ -1,0 +1,24 @@
+{
+  "name": "thats-whatsupp-backend",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/selanier0523-crs/Thats-Whatsupp-Backend.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/selanier0523-crs/Thats-Whatsupp-Backend/issues"
+  },
+  "homepage": "https://github.com/selanier0523-crs/Thats-Whatsupp-Backend#readme",
+  "dependencies": {
+    "express": "^5.2.1"
+  }
+}

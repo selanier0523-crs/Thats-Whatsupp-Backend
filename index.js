@@ -123,12 +123,9 @@ app.get("/version", (req, res) => {
 // Visual filters for your Search page (frontend can use these immediately)
 app.get("/api/filters", (req, res) => {
   res.json({
-    goals: ["Energy", "Sleep", "Focus", "Stress", "Gut", "Recovery"],
-    forms: ["Capsule", "Tablet", "Powder", "Gummy", "Liquid"],
-    budgets: ["$", "$$", "$$$"],
-    certifications: ["Third-party tested", "NSF", "USP", "Informed Choice"],
-    avoidCommon: ["Melatonin", "Caffeine", "Artificial colors", "Gelatin"],
-    allergens: ["Dairy", "Gluten", "Soy", "Egg", "Tree nuts", "Peanuts"],
+    backend: {
+      connected: true
+    }
   });
 });
 

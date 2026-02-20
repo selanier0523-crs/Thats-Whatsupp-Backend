@@ -10,6 +10,8 @@ if (process.env.NODE_ENV !== "production") {
 const express = require("express");
 const app = express();
 
+const supabase = require("./database/supabase");
+
 // If you ever put this behind a proxy (Render does), this helps with correct IP/proto handling
 app.set("trust proxy", 1);
 
@@ -83,6 +85,17 @@ app.use((req, res, next) => {
 
 // ---- Routes ----
 
+app.get("/api/test-db", async (req, res) => {
+  const { data, error } = await supabase
+    .from("supplements")
+    .select("*")
+    .limit(5);
+
+  if (error) return res.status(500).json({ error });
+
+  res.json({ data });
+});
+
 // Root
 app.get("/", (req, res) => {
   res.send("Backend is running");
@@ -120,17 +133,26 @@ app.get("/api/filters", (req, res) => {
 });
 
 // Search endpoint (will query Supabase Postgres later)
-app.get("/api/search", (req, res) => {
+app.get("/api/search", async (req, res) => {
   const q = String(req.query.q || "").trim();
 
-  res.json({
-    query: q,
-    results: [],
-    message:
-      "No results yet. Once Supabase is connected and NIH ingestion runs, results will show here.",
-  });
-});
+  let query = supabase
+    .from("supplements")
+    .select("id,name,brand,form,goals,certifications,contains,allergens,budget_tier,description")
+    .limit(25);
 
+  if (q) {
+    query = query.or(
+      `name.ilike.%${q}%,brand.ilike.%${q}%,description.ilike.%${q}%`
+    );
+  }
+
+  const { data, error } = await query;
+
+  if (error) return res.status(500).json({ error: error.message });
+
+  res.json({ query: q, results: data });
+});
 // Chat endpoint (will call your recommendation logic later)
 app.post("/api/chat", (req, res) => {
   const message = typeof req.body?.message === "string" ? req.body.message : "";

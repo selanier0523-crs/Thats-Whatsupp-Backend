@@ -131,16 +131,16 @@ app.get("/api/filters", (req, res) => {
 
 // Search endpoint (will query Supabase Postgres later)
 app.get("/api/search", async (req, res) => {
-  const q = String(req.query.q || "").trim();
+  const searchkey = String(req.query.searchkey || "").trim();
 
   let query = supabase
     .from("supplements")
     .select("id,name,brand,form,goals,certifications,contains,allergens,budget_tier,description")
     .limit(25);
 
-  if (q) {
+  if (searchkey) {
     query = query.or(
-      `name.ilike.%${q}%,brand.ilike.%${q}%,description.ilike.%${q}%`
+      `name.ilike.%${searchkey}%,brand.ilike.%${searchkey}%,description.ilike.%${searchkey}%`
     );
   }
 
@@ -148,7 +148,7 @@ app.get("/api/search", async (req, res) => {
 
   if (error) return res.status(500).json({ error: error.message });
 
-  res.json({ query: q, results: data });
+  res.json({ query: searchkey, results: data });
 });
 // Chat endpoint (will call your recommendation logic later)
 app.post("/api/chat", (req, res) => {

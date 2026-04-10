@@ -5,12 +5,27 @@ exports.search = async (req, res) => {
 
   let query = supabase
     .from("supplements")
-    .select("id,name,brand,form,goals,certifications,contains,allergens,budget_tier,description")
+    .select(`
+      product_name,
+      brand,
+      delivery_method,
+      allergens,
+      description,
+      image,
+      supplement_type,
+      supplement_sizes (
+        price,
+        size,
+        size_numeric,
+        price_per,
+        link
+      )
+    `)
     .limit(25);
 
   if (q) {
     query = query.or(
-      `name.ilike.%${q}%,brand.ilike.%${q}%,description.ilike.%${q}%`
+      `product_name.ilike.%${q}%,brand.ilike.%${q}%,supplement_type.ilike.%${q}%`
     );
   }
 

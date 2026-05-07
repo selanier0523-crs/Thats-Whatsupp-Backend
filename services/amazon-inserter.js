@@ -1,22 +1,25 @@
 // services/amazon-inserter.js
 //
-// This version does NOT insert into Supabase directly.
-// It scrapes the data, builds the final add_product(...) SQL statement,
-// and prints that statement so you can paste it into Supabase manually.
+// Scrapes Amazon product/variant data and inserts it into Supabase directly.
 //
 // Assumptions:
 // - You already have services/amazon-scraper.js working
-// - That scraper exports scrapeAmazonProduct
-// - Your final SQL function is add_product(..., p_flavors jsonb)
+// - Your final SQL function is add_product_test(..., p_flavors jsonb)
 // - You are NOT using flavor_allergens anymore
 //
 // Fill in the INPUT BLOCK below, then run:
 // node services/amazon-inserter.js
 
-const { scrapeAmazonProduct } = require("./amazon-scraper");
+if (process.env.NODE_ENV !== "production") {
+    require("dotenv").config();
+}
+
+const supabase = require("../database/supabase");
+const { createAmazonScraperSession } = require("./amazon-scraper");
 
 const CANNOT_VERIFY = "cannot verify";
 const CANNOT_FOLLOW_LINK = "cannot follow link";
+const ADD_PRODUCT_RPC = "add_product_test";
 
 // =========================================================
 // INPUT BLOCK
@@ -34,8 +37,7 @@ const input = {
         "https://amzn.to/4cuT5JA",
         "https://amzn.to/4sCOkn6"
     ],
-    supplement_type: "Pump Enhancer",
-    description: "Hard-Hitting Pump with Zero Stimulants: GHOST Pump raises the bar with pump ingredients we all love and zero stimulants, meaning you can take it solo or stack it with GHOST Legend. WARHEADS Sour Watermelon flavor. 40 scoops per container. Vegan Fermented L- Citrulline: Citrulline delivers amazing pumps without the potential for stomach discomfort, and since its vegan fermented, GHOST Pump is vegan friendly! Yup, We’re Obsessed with Nitric Oxide Products: Our nitrate ingredient NO3 - T Arginine Nitrate attacks nitric oxide from a much different and more advanced angle than the rest of the GHOST Pump formula, delivering a complete, all - out pump experience unlike anything we’ve tried or tested.* Ever. Total Transparency: All GHOST products feature a transparent label that fully discloses the dose of each active ingredient.Zero proprietary blends means you know what you’re getting in each and every scoop.GHOST Pump is vegan, soy - free, gluten - free, and sugar - free. BE SEEN: As a premium active lifestyle brand, GHOST is powering and empowering users to BE SEEN beyond the walls of the gym.The name GHOST and mantra “BE SEEN” come from that feeling of being behind the scenes and wanting to be heard, waiting to make an impact.We’re all Ghosts.This is our time.",
+    supplement_type: "", //Optional, leave blank if you want to use the scraper's result for this
     allergens: "NONE",
 };
 
@@ -88,41 +90,46 @@ function formatMoney(value) {
     return value.toFixed(2);
 }
 
-function parseSizeNumeric(sizeVariable) {
-    if (!sizeVariable) return null;
+function formatPricePer(pricePerNumeric, unit) {
+    if (!Number.isFinite(pricePerNumeric) || !unit) return null;
+    return `$${formatMoney(pricePerNumeric)} / ${normalizeWhitespace(unit)}`;
+}
 
-    const cleaned = normalizeWhitespace(sizeVariable);
+function parseSizeNumeric(sizeText) {
+    if (!sizeText) return null;
+
+    const cleaned = normalizeWhitespace(sizeText);
 
     if (!cleaned || cleaned === CANNOT_VERIFY) {
         return null;
     }
 
-    const match = cleaned.replace(/,/g, "").match(/(\d+(?:\.\d+)?)/);
+    const match = cleaned.replace(/,/g, "").match(/^(\d+(?:\.\d+)?)(?:\s|$)/);
 
     if (!match) {
         return null;
     }
 
     const numeric = Number(match[1]);
-
     return Number.isFinite(numeric) ? numeric : null;
 }
 
-function parseSizeUnit(sizeVariable) {
-    if (!sizeVariable) return null;
+function parseSizeUnit(sizeText) {
+    if (!sizeText) return null;
 
-    const cleaned = normalizeWhitespace(sizeVariable);
+    const cleaned = normalizeWhitespace(sizeText);
 
     if (!cleaned || cleaned === CANNOT_VERIFY) {
         return null;
     }
 
-    const unit = cleaned
-        .replace(/^[\d.,]+\s*/, "")
-        .replace(/\(.*?\)/g, "")
-        .trim();
+    const match = cleaned.match(/^\d+(?:\.\d+)?\s+(.+)$/);
 
-    return unit || null;
+    if (!match) {
+        return null;
+    }
+
+    return normalizeWhitespace(match[1]) || null;
 }
 
 function escapeForRegex(value) {
@@ -169,10 +176,16 @@ function parseScrapedPricePer(pricePerText) {
     }
 
     const numeric = parseDollarAmount(cleaned);
+    const unitMatch = cleaned
+        .replace(/[()]/g, " ")
+        .match(/\/\s*([A-Za-z][A-Za-z\s.-]*)(?:\s|$)/);
+    const unit = unitMatch ? normalizeWhitespace(unitMatch[1]) : null;
+    const pricePerNumeric = numeric != null ? roundToTwo(numeric) : null;
+    const pricePer = formatPricePer(pricePerNumeric, unit);
 
     return {
-        price_per_numeric: numeric != null ? roundToTwo(numeric) : null,
-        price_per: cleaned,
+        price_per_numeric: pricePerNumeric,
+        price_per: pricePer,
     };
 }
 
@@ -188,7 +201,7 @@ function buildFallbackPricePer(price, sizeNumeric, sizeVariable) {
 
     return {
         price_per_numeric: pricePerNumeric,
-        price_per: `$${formatMoney(pricePerNumeric)} / ${sizeVariable}`,
+        price_per: formatPricePer(pricePerNumeric, sizeVariable),
     };
 }
 
@@ -200,6 +213,58 @@ function getPricePerValues(scrapedPricePerText, price, sizeNumeric, sizeVariable
     }
 
     return buildFallbackPricePer(price, sizeNumeric, sizeVariable);
+}
+
+const SUPPLEMENT_TYPE_INFERENCE_RULES = [
+    { type: "Protein Powder", patterns: [/protein\s+powder/i, /\bwhey\b/i, /\bcasein\b/i] },
+    { type: "Creatine", patterns: [/\bcreatine\b/i] },
+    { type: "Pre-Workout", patterns: [/\bpre[\s-]?workout\b/i] },
+    { type: "Pump Enhancer", patterns: [/\bpump\b/i] },
+    { type: "Collagen", patterns: [/\bcollagen\b/i] },
+    { type: "Electrolytes", patterns: [/\belectrolytes?\b/i] },
+    { type: "Multivitamin", patterns: [/\bmultivitamins?\b/i, /\bmulti\s+vitamins?\b/i] },
+    { type: "Omega-3", patterns: [/\bomega[\s-]?3\b/i, /\bfish\s+oil\b/i] },
+    { type: "Probiotic", patterns: [/\bprobiotics?\b/i] },
+];
+
+function inferSupplementType(headerResult) {
+    const searchableText = [
+        headerResult?.product_title,
+        headerResult?.description,
+        headerResult?.delivery_method,
+    ]
+        .map((value) => safeText(value))
+        .filter((value) => value && value !== CANNOT_VERIFY && value !== CANNOT_FOLLOW_LINK)
+        .join(" ");
+
+    if (!searchableText) return null;
+
+    for (const rule of SUPPLEMENT_TYPE_INFERENCE_RULES) {
+        if (rule.patterns.some((pattern) => pattern.test(searchableText))) {
+            return rule.type;
+        }
+    }
+
+    return null;
+}
+
+function resolveSupplementType(cleanedConfig, headerResult) {
+    const override = safeText(cleanedConfig?.supplement_type);
+    if (override && override !== CANNOT_VERIFY && override !== CANNOT_FOLLOW_LINK) {
+        return override;
+    }
+
+    const scraped = safeText(headerResult?.primary_supplement_type);
+    if (scraped && scraped !== CANNOT_VERIFY && scraped !== CANNOT_FOLLOW_LINK) {
+        return scraped;
+    }
+
+    const inferred = inferSupplementType(headerResult);
+    if (inferred) return inferred;
+
+    throw new Error(
+        "Could not determine supplement_type. Fill input.supplement_type manually or use a product title/description with a recognizable supplement category."
+    );
 }
 
 function validateInputBlock(config) {
@@ -229,13 +294,6 @@ function validateInputBlock(config) {
         }
     });
 
-    if (isBlank(config.supplement_type) || isPlaceholder(config.supplement_type)) {
-        errors.push("supplement_type");
-    }
-
-    if (isBlank(config.description) || isPlaceholder(config.description)) {
-        errors.push("description");
-    }
 
     if (isBlank(config.allergens) || isPlaceholder(config.allergens)) {
         errors.push("allergens");
@@ -251,7 +309,6 @@ function validateInputBlock(config) {
         overall_product_link: safeText(config.overall_product_link),
         affiliate_links: cleanedAffiliateLinks,
         supplement_type: safeText(config.supplement_type),
-        description: safeText(config.description),
         allergens: safeText(config.allergens),
     };
 }
@@ -261,6 +318,9 @@ function validateHeaderResult(headerResult) {
 
     if (!headerResult || headerResult.status !== "ok") {
         missing.push("status");
+    }
+    if (!safeText(headerResult.description) || headerResult.description === CANNOT_VERIFY) {
+        missing.push("description");
     }
     if (!safeText(headerResult.product_title) || headerResult.product_title === CANNOT_VERIFY) {
         missing.push("product_title");
@@ -274,7 +334,6 @@ function validateHeaderResult(headerResult) {
     if (!safeText(headerResult.image_link) || headerResult.image_link === CANNOT_VERIFY) {
         missing.push("image_link");
     }
-
     if (missing.length > 0) {
         throw new Error(
             `Overall product link could not provide required data. Missing: ${missing.join(", ")}`
@@ -357,13 +416,18 @@ function buildFlavorsJson(headerResult, variantResults) {
 
     for (const result of variantResults) {
         const flavor = safeText(result.flavor);
-        const rawSize = safeText(result.selected_size);
+        const rawUnitCount =
+            safeText(result.unit_count) && result.unit_count !== CANNOT_VERIFY
+                ? safeText(result.unit_count)
+                : safeText(result.selected_size);
+
         const price = parseDollarAmount(result.current_visible_price);
-        const sizeNumeric = parseSizeNumeric(rawSize);
-        const sizeVariable = parseSizeUnit(rawSize);
+        const sizeNumeric = parseSizeNumeric(rawUnitCount);
+        const sizeVariable = parseSizeUnit(rawUnitCount);
+
         if (!sizeVariable) {
             throw new Error(
-                `Could not parse size_variable from selected_size: ${result.selected_size}\nLink: ${result.original_input}`
+                `Could not parse size_variable from unit_count/selected_size: ${rawUnitCount}\nLink: ${result.original_input}`
             );
         }
         const image =
@@ -386,7 +450,7 @@ function buildFlavorsJson(headerResult, variantResults) {
 
         if (sizeNumeric == null) {
             throw new Error(
-                `Could not parse size_numeric for affiliate link: ${result.original_input}\nRaw value: ${result.selected_size}`
+                `Could not parse size_numeric for affiliate link: ${result.original_input}\nRaw value: ${rawUnitCount}`
             );
         }
 
@@ -428,7 +492,7 @@ function buildAddProductSql(payload) {
     const prettyJson = JSON.stringify(payload.p_flavors, null, 2);
 
     return [
-        "SELECT add_product(",
+        `SELECT ${ADD_PRODUCT_RPC}(`,
         `  ${sqlLiteral(payload.p_product_name)},`,
         `  ${sqlLiteral(payload.p_brand)},`,
         `  ${sqlLiteral(payload.p_supplement_type)},`,
@@ -441,55 +505,80 @@ function buildAddProductSql(payload) {
     ].join("\n");
 }
 
-async function runInserter(config) {
-    const cleanedConfig = validateInputBlock(config);
+async function insertProductIntoSupabase(payload) {
+    const { data, error } = await supabase.rpc(ADD_PRODUCT_RPC, payload);
 
-    console.log("Scraping overall product link...");
-    const headerResult = await scrapeAmazonProduct(cleanedConfig.overall_product_link);
-    validateHeaderResult(headerResult);
-
-    console.log("Scraping affiliate links...");
-    const variantResults = [];
-
-    for (const link of cleanedConfig.affiliate_links) {
-        console.log(`- ${link}`);
-
-        const result = await scrapeAmazonProduct(link);
-
-        if (!result || result.status !== "ok") {
-            throw new Error(`Affiliate link failed to load: ${link}`);
-        }
-
-        validateVariantResult(result, link);
-        variantResults.push(result);
-    }
-
-    checkForDuplicateAsins(variantResults);
-    //checkForDuplicateFlavorSize(variantResults);
-
-    const productName = deriveProductName(headerResult);
-
-    if (!productName) {
+    if (error) {
+        const fallbackSql = buildAddProductSql(payload);
         throw new Error(
-            `Could not derive product_name from the overall product title: ${headerResult.product_title}`
+            `Supabase insert failed: ${error.message}\n\nFallback SQL:\n${fallbackSql}`
         );
     }
 
-    const payload = {
-        p_product_name: productName,
-        p_brand: safeText(headerResult.brand),
-        p_supplement_type: cleanedConfig.supplement_type,
-        p_delivery_method: safeText(headerResult.delivery_method),
-        p_allergens: cleanedConfig.allergens,
-        p_description: cleanedConfig.description,
-        p_main_image: safeText(headerResult.image_link),
-        p_flavors: buildFlavorsJson(headerResult, variantResults),
-    };
+    return data;
+}
 
-    const sql = buildAddProductSql(payload);
+async function runInserter(config) {
+    const cleanedConfig = validateInputBlock(config);
+    const scraper = await createAmazonScraperSession();
 
-    console.log("\nCOPY AND PASTE THIS INTO SUPABASE:\n");
-    console.log(sql);
+    try {
+        console.log("Scraping overall product link...");
+        const headerResult = await scraper.scrape(cleanedConfig.overall_product_link);
+        validateHeaderResult(headerResult);
+        const supplementType = resolveSupplementType(cleanedConfig, headerResult);
+
+        console.log("Scraping affiliate links...");
+        const variantResults = [];
+
+        for (const link of cleanedConfig.affiliate_links) {
+            console.log(`- ${link}`);
+
+            const result = await scraper.scrape(link);
+
+            if (!result || result.status !== "ok") {
+                throw new Error(`Affiliate link failed to load: ${link}`);
+            }
+
+            validateVariantResult(result, link);
+            variantResults.push(result);
+        }
+
+        checkForDuplicateAsins(variantResults);
+        //checkForDuplicateFlavorSize(variantResults);
+
+        const productName = deriveProductName(headerResult);
+
+        if (!productName) {
+            throw new Error(
+                `Could not derive product_name from the overall product title: ${headerResult.product_title}`
+            );
+        }
+
+        const payload = {
+            p_product_name: productName,
+            p_brand: safeText(headerResult.brand),
+            p_supplement_type: supplementType,
+            p_delivery_method: safeText(headerResult.delivery_method),
+            p_allergens: cleanedConfig.allergens,
+            p_description: safeText(headerResult.description),
+            p_main_image: safeText(headerResult.image_link),
+            p_flavors: buildFlavorsJson(headerResult, variantResults),
+        };
+
+        console.log("\nInserting product into Supabase...");
+        const insertedProduct = await insertProductIntoSupabase(payload);
+
+        console.log("\nSUPABASE INSERT COMPLETE\n");
+        console.log({
+            product_name: payload.p_product_name,
+            brand: payload.p_brand,
+            flavor_count: payload.p_flavors.length,
+            result: insertedProduct,
+        });
+    } finally {
+        await scraper.close();
+    }
 }
 
 if (require.main === module) {
@@ -501,5 +590,10 @@ if (require.main === module) {
 }
 
 module.exports = {
+    buildAddProductSql,
+    inferSupplementType,
+    insertProductIntoSupabase,
+    parseScrapedPricePer,
+    resolveSupplementType,
     runInserter,
 };
